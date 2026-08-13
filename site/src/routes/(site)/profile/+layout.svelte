@@ -9,6 +9,7 @@
 		FileText,
 		Code,
 		FolderOpen,
+		Languages,
 		ChevronRight
 	} from '@lucide/svelte';
 
@@ -55,6 +56,12 @@
 			href: '/profile/certifications/',
 			icon: Award,
 			description: 'Professional certifications'
+		},
+		{
+			name: 'Languages',
+			href: '/profile/languages/',
+			icon: Languages,
+			description: 'Languages you read, write or speak'
 		}
 	];
 
@@ -86,7 +93,7 @@
 		<nav class="mb-5" aria-label="Breadcrumb">
 			<ol class="flex items-center gap-2 text-sm text-gray-400">
 				<li>
-					<a href="/jobseeker-dashboard/" class="hover:text-white transition-colors">Dashboard</a>
+					<a href="/profile/" class="hover:text-white transition-colors">Dashboard</a>
 				</li>
 				<li class="flex items-center gap-2">
 					<ChevronRight size={14} />

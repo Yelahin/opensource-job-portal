@@ -15,7 +15,7 @@ from rest_framework.response import Response
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from rest_framework_simplejwt.views import TokenRefreshView
 
-from peeldb.models import Google
+from peeldb.models import Google, User
 
 from ..common.responses import (
     VALIDATION_ERROR_RESPONSE,
@@ -24,11 +24,14 @@ from ..common.responses import (
     SuccessMessageResponseSerializer,
 )
 from .serializers import (
+    ChangeEmailResponseSerializer,
+    ChangeEmailSerializer,
     ChangePasswordErrorSerializer,
     ChangePasswordSerializer,
     ForgotPasswordSerializer,
     GoogleAuthSerializer,
     GoogleUrlRequestSerializer,
+    LoginSerializer,
     LogoutResponseSerializer,
     RefreshTokenSerializer,
     RegisterResponseSerializer,
@@ -37,6 +40,7 @@ from .serializers import (
     ResetPasswordSerializer,
     TokenResponseSerializer,
     UserSerializer,
+    VerifyEmailChangeSerializer,
     VerifyEmailResponseSerializer,
     VerifyEmailSerializer,
 )
@@ -82,12 +86,9 @@ def send_password_reset_email(user, request):
 
     from dashboard.tasks import send_email
 
-    # Use site UI URL for password reset
-    frontend_url = (
-        settings.SITE_FRONTEND_URL
-        if hasattr(settings, "SITE_FRONTEND_URL")
-        else "http://localhost:5173"
-    )
+    # Defined in settings.py, so no hasattr fallback — a missing setting should
+    # fail loudly rather than mail everyone a localhost link.
+    frontend_url = settings.SITE_FRONTEND_URL.rstrip("/")
     reset_url = f"{frontend_url}/reset-password/?token={user.activation_code}"
 
     # Render email template
@@ -148,6 +149,47 @@ def register(request):
                 "message": "Registration successful. Please check your email to verify your account.",
             },
             status=status.HTTP_201_CREATED,
+        )
+
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@extend_schema(
+    tags=["Authentication"],
+    summary="Login",
+    description=(
+        "Authenticate a job seeker with email and password. Returns JWT "
+        "tokens in the response body only — SvelteKit puts them in HttpOnly "
+        "cookies, Django never sets one."
+    ),
+    request=LoginSerializer,
+    responses={
+        200: TokenResponseSerializer,
+        400: VALIDATION_ERROR_RESPONSE,
+    },
+)
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def login(request):
+    """
+    Log a job seeker in with email and password
+
+    Employer accounts are rejected here and sent to the recruiter login.
+    """
+    serializer = LoginSerializer(data=request.data)
+
+    if serializer.is_valid():
+        user = serializer.validated_data["user"]
+        tokens = get_tokens_for_user(user)
+
+        return Response(
+            {
+                "success": True,
+                "user": UserSerializer(user).data,
+                "access": tokens["access"],
+                "refresh": tokens["refresh"],
+            },
+            status=status.HTTP_200_OK,
         )
 
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -441,7 +483,7 @@ def google_auth_url(request):
                     "profile_completion_percentage": 45,
                 },
                 "requires_profile_completion": True,
-                "redirect_to": "/profile/complete",
+                "redirect_to": "/",
                 "is_new_user": True,
             },
             response_only=True,
@@ -476,10 +518,14 @@ def google_auth_callback(request):
             ...
         },
         "requires_profile_completion": true,
-        "redirect_to": "/profile/complete",
+        "redirect_to": "/",
         "is_new_user": true
     }
     ```
+
+    `redirect_to` is followed verbatim by the frontend callback, so it only ever
+    names a route the job-seeker site actually serves. There is no dedicated
+    profile-completion page; `requires_profile_completion` is advisory.
 
     **Workflow:**
     1. Exchange Google auth code for access token
@@ -845,9 +891,20 @@ class CookieTokenRefreshView(TokenRefreshView):
                 access_token = response.data.get("access")
                 new_refresh_token = response.data.get("refresh", refresh_token)
 
-                # Create new response without tokens in body
+                # Tokens go in the body *and* in cookies.
+                #
+                # The cookies below only work when the browser talks to Django
+                # on the same domain. The SvelteKit frontends are served from
+                # their own domains and own their own HttpOnly cookies, so
+                # their servers read the tokens from the body here and re-issue
+                # them first-party. Both audiences are served; adding the body
+                # fields is backward compatible with the cookie-based callers.
                 new_response = Response(
-                    {"message": "Token refreshed successfully"},
+                    {
+                        "message": "Token refreshed successfully",
+                        "access": access_token,
+                        "refresh": new_refresh_token,
+                    },
                     status=status.HTTP_200_OK,
                 )
 
@@ -887,3 +944,160 @@ class CookieTokenRefreshView(TokenRefreshView):
                 {"error": "Invalid or expired refresh token", "detail": str(e)},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
+
+
+def send_email_change_verification(user, request):
+    """
+    Mail the confirmation link to the **pending** address, not the current one.
+
+    That is the whole point of the flow: the token is only redeemable by
+    somebody who can read the new inbox, which is what proves the address is
+    real before it becomes the login identifier.
+    """
+    from datetime import datetime
+
+    from django.template import loader
+
+    from dashboard.tasks import send_email
+
+    frontend_url = settings.SITE_FRONTEND_URL.rstrip("/")
+    verification_url = (
+        f"{frontend_url}/verify-email-change/?token={user.activation_code}"
+    )
+
+    template = loader.get_template("jobseeker/email/verification.html")
+    html_content = template.render(
+        {
+            "user": user,
+            "verification_url": verification_url,
+            "current_year": datetime.now().year,
+        }
+    )
+
+    send_email.delay(
+        mto=[user.pending_email],
+        msubject="Confirm your new PeelJobs email address",
+        mbody=html_content,
+    )
+
+
+@extend_schema(
+    tags=["Authentication"],
+    summary="Request Email Change",
+    description=(
+        "Start changing the account's email address. Sends a confirmation link "
+        "to the new address; the account keeps its current address until that "
+        "link is redeemed via `verify-email-change/`."
+    ),
+    request=ChangeEmailSerializer,
+    responses={
+        200: ChangeEmailResponseSerializer,
+        400: VALIDATION_ERROR_RESPONSE,
+    },
+)
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def change_email(request):
+    """Request a change of email address for the authenticated job seeker."""
+    serializer = ChangeEmailSerializer(data=request.data, context={"request": request})
+
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    user = request.user
+    user.pending_email = serializer.validated_data["new_email"]
+    user.activation_code = get_random_string(32)
+    user.save(update_fields=["pending_email", "activation_code"])
+
+    send_email_change_verification(user, request)
+
+    return Response(
+        {
+            "message": (
+                "Check your new inbox — we've sent a confirmation link to "
+                f"{user.pending_email}. Your current address stays active "
+                "until you confirm."
+            ),
+            "pending_email": user.pending_email,
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+@extend_schema(
+    tags=["Authentication"],
+    summary="Confirm Email Change",
+    description=(
+        "Redeem the token mailed to the new address and complete the change. "
+        "Unauthenticated: the link is opened from an inbox, which may not be "
+        "the browser holding the session."
+    ),
+    request=VerifyEmailChangeSerializer,
+    responses={
+        200: MessageResponseSerializer,
+        400: VALIDATION_ERROR_RESPONSE,
+    },
+)
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def verify_email_change(request):
+    """Complete an email change started by ``change_email``."""
+    serializer = VerifyEmailChangeSerializer(data=request.data)
+
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    token = serializer.validated_data["token"]
+
+    # `activation_code` is also used by registration and password reset, so
+    # match on a non-empty `pending_email` too — otherwise an unrelated live
+    # token could land here and blank somebody's address.
+    user = User.objects.filter(activation_code=token).exclude(pending_email="").first()
+
+    if not user:
+        return Response(
+            {"error": "This link is invalid or has already been used."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # Re-check uniqueness at redemption: another account may have taken the
+    # address in the window between request and confirmation.
+    if (
+        User.objects.filter(email__iexact=user.pending_email)
+        .exclude(pk=user.pk)
+        .exists()
+    ):
+        user.pending_email = ""
+        user.activation_code = ""
+        user.save(update_fields=["pending_email", "activation_code"])
+        return Response(
+            {"error": "That email address is no longer available."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # `USERNAME_FIELD` is "email", so login follows the new address on its own.
+    # But `username` is a separate unique column that mirrors the email for
+    # 22,037 of 22,131 job seekers, and leaving a stale copy behind would block
+    # anyone who later registers with the freed address.
+    previous_email = (user.email or "").lower()
+    if (user.username or "").lower() == previous_email:
+        user.username = user.pending_email
+
+    user.email = user.pending_email
+    user.pending_email = ""
+    user.activation_code = ""
+    user.email_verified = True
+    user.save(
+        update_fields=[
+            "email",
+            "username",
+            "pending_email",
+            "activation_code",
+            "email_verified",
+        ]
+    )
+
+    return Response(
+        {"message": "Your email address has been updated."},
+        status=status.HTTP_200_OK,
+    )

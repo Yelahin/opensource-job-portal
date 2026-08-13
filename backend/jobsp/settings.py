@@ -30,8 +30,27 @@ DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "peeljobs@micropyramid.com"
 
 PEEL_URL = os.getenv("PEEL_URL", "http://peeljobs.com/")
 
-# Recruiter Frontend URL for team invitation emails
-RECRUITER_FRONTEND_URL = os.getenv("RECRUITER_FRONTEND_URL", "http://localhost:5173")
+# Recruiter Frontend URL for team invitation emails and the legacy
+# /recruiter/ redirects. The recruiter UI runs on 5174; 5173 is the job-seeker
+# site.
+RECRUITER_FRONTEND_URL = os.getenv("RECRUITER_FRONTEND_URL", "http://localhost:5174")
+
+# Job-seeker frontend URL, used to build the password-reset link in
+# api/v1/auth/views.py. That code read this via hasattr() with a hardcoded
+# localhost:5173 fallback, and the setting had never been defined — so every
+# reset email in production would have linked to localhost.
+SITE_FRONTEND_URL = os.getenv("SITE_FRONTEND_URL", "http://localhost:5173")
+
+# Bare hostname used to build absolute <loc> URLs in the sitemaps.
+#
+# django.contrib.sitemaps takes this from the Sites framework, and the `sites`
+# row was never configured off Django's default — so every <loc> in every
+# sitemap read `https://example.com/...`, all 27,000 of them. Nothing else in
+# the codebase touches Site.objects or get_current(), so the Sites row had no
+# other job; psite.sitemaps.PeelJobsSitemap now overrides `get_domain()` to
+# read this instead. Kept as a setting rather than a fixed Site row so it
+# cannot silently drift per environment.
+SITE_DOMAIN = os.getenv("SITE_DOMAIN", "peeljobs.com")
 
 CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/1")
 CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND")
@@ -148,9 +167,7 @@ INSTALLED_APPS = (
     "storages",
     "peeldb",
     # 'django_simple_forum',
-    "haystack",
     "dashboard",
-    "search",
     # "simple_pagination",
     "django_celery_beat",
     "corsheaders",
@@ -212,6 +229,34 @@ AUTHENTICATION_BACKENDS = (
     "django.contrib.auth.backends.ModelBackend",
 )
 
+# This setting was absent, and Django treats a missing AUTH_PASSWORD_VALIDATORS
+# as an empty list — so every validate_password() call in the API ran zero
+# checks and accepted "password123". Registration, password reset and change
+# password were all affected.
+#
+# Only new and changed passwords are validated; existing hashes are untouched.
+AUTH_PASSWORD_VALIDATORS = [
+    # Rejects a password that looks like the user's own email or name. Only
+    # runs when validate_password() is given the user, which is why the
+    # serializers pass one.
+    {
+        "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator",
+        "OPTIONS": {
+            "user_attributes": ("username", "first_name", "last_name", "email")
+        },
+    },
+    # Matches the min_length already declared on the password serializer
+    # fields, so the two cannot drift apart.
+    {
+        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+        "OPTIONS": {"min_length": 8},
+    },
+    # The one that catches "password123" — Django ships a list of the 20,000
+    # most common passwords.
+    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
+    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
+]
+
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
@@ -225,6 +270,7 @@ TEMPLATES = [
                 "django.contrib.messages.context_processors.messages",
                 # "jobsp.context_processors.export_vars",
                 "peeldb.context_processors.get_pj_icons",
+                "peeldb.context_processors.frontend_urls",
             ],
         },
     },
@@ -268,28 +314,17 @@ COMPRESS_OFFLINE_CONTEXT = {
 STATICFILES_DIRS = (os.path.join(BASE_DIR, "static"),)
 
 
-# Haystack settings for Elasticsearch
-# HAYSTACK_CONNECTIONS = {
-#     "default": {
-#         "ENGINE": "peeldb.backends.ConfigurableElasticSearchEngine",
-#         "URL": "http://127.0.0.1:9200/",
-#         "INDEX_NAME": "job_haystack",
-#         "TIMEOUT": 60,
-#     },
-# }
-
-HAYSTACK_CONNECTIONS = {
-    "default": {
-        "ENGINE": "haystack.backends.elasticsearch7_backend.Elasticsearch7SearchEngine",
-        "URL": "http://127.0.0.1:9200/",
-        "INDEX_NAME": "haystack",
-    },
-}
-
-
-HAYSTACK_SIGNAL_PROCESSOR = "haystack.signals.RealtimeSignalProcessor"
-HAYSTACK_DEFAULT_OPERATOR = "OR"
-HAYSTACK_SEARCH_RESULTS_PER_PAGE = 1
+# Search is Postgres full-text search, configured on the model rather than
+# here: JobPost.search_vector is a generated tsvector column with a GIN index,
+# queried by api/v1/jobs/filters.py. There is no search service to point at, no
+# index to rebuild and no credentials to hold, so this section is empty by
+# design.
+#
+# It previously held HAYSTACK_CONNECTIONS + a RealtimeSignalProcessor against
+# Elasticsearch 7. Nothing queried that index by the time it was removed, and
+# the signal processor meant no test could save a Skill, City, User or JobPost
+# without a live Elasticsearch — which is why jobsp/test_runner.py existed.
+# Both are gone; TEST_RUNNER is back to the Django default.
 
 CELERY_TIMEZONE = "Asia/Calcutta"
 
@@ -372,12 +407,6 @@ CELERY_BEAT_SCHEDULE = {
     #     "task": "dashboard.tasks.recruiter_profile_update_notifications",
     #     "schedule": crontab(hour="09", minute="30", day_of_week="mon"),
     # },
-    "haystack-rebuilding-indexes": {
-        "task": "dashboard.tasks.rebuilding_index",
-        "schedule": crontab(
-            hour="00", minute="20", day_of_week="mon,tue,wed,thu,fri,sat,sun"
-        ),
-    },
     "check-expiring-jobs-and-send-notifications": {
         "task": "dashboard.tasks.check_expiring_jobs",
         "schedule": crontab(

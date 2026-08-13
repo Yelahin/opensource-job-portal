@@ -10,7 +10,6 @@ from peeldb.models import (
     AppliedJobs,
     City,
     Company,
-    FunctionalArea,
     Industry,
     JobPost,
     Qualification,
@@ -53,14 +52,6 @@ class QualificationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Qualification
         fields = ["id", "name", "slug"]
-
-
-class FunctionalAreaSerializer(serializers.ModelSerializer):
-    """Serializer for functional areas"""
-
-    class Meta:
-        model = FunctionalArea
-        fields = ["id", "name"]
 
 
 class CompanySerializer(serializers.ModelSerializer):
@@ -253,7 +244,6 @@ class JobDetailSerializer(JobListSerializer):
 
     company = CompanySerializer(read_only=True)
     edu_qualification = QualificationSerializer(many=True, read_only=True)
-    functional_area = FunctionalAreaSerializer(many=True, read_only=True)
 
     class Meta(JobListSerializer.Meta):
         fields = JobListSerializer.Meta.fields + [
@@ -265,7 +255,6 @@ class JobDetailSerializer(JobListSerializer):
             "company_links",
             "company_emails",
             "edu_qualification",
-            "functional_area",
             # Walk-in specific fields
             "walkin_contactinfo",
             "walkin_show_contact_info",
@@ -283,3 +272,24 @@ class JobDetailSerializer(JobListSerializer):
             "govt_exam_date",
             "age_relaxation",
         ]
+
+
+class AppliedJobSerializer(serializers.ModelSerializer):
+    """
+    One row of "my applications" — the job, plus this user's application to it.
+
+    The job is nested with JobListSerializer so the applications page renders
+    the same card as every other job listing.
+    """
+
+    job = JobListSerializer(source="job_post", read_only=True)
+
+    class Meta:
+        model = AppliedJobs
+        fields = [
+            "id",
+            "job",
+            "status",
+            "applied_on",
+        ]
+        read_only_fields = fields

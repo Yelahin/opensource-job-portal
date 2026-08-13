@@ -41,8 +41,10 @@ from .job_serializers import (
     RecruiterJobFormMetadataSerializer,
     RecruiterJobListSerializer,
     RecruiterJobMutationResponseSerializer,
+    RecruiterJobNotificationsSerializer,
     RecruiterJobUpdateSerializer,
 )
+from .scoping import recruiter_jobs
 
 
 class JobPostPagination(PageNumberPagination):
@@ -90,9 +92,9 @@ def list_jobs(request):
     """
     user = request.user
 
-    # Base queryset - jobs posted by this user
+    # Base queryset - the caller's jobs, or the whole company's for an admin
     queryset = (
-        JobPost.objects.filter(user=user)
+        recruiter_jobs(user)
         .select_related("company", "country")
         .prefetch_related("location", "skills", "industry", "edu_qualification")
     )
@@ -156,9 +158,10 @@ def get_job(request, job_id):
 
     try:
         job = (
-            JobPost.objects.select_related("company", "country")
+            recruiter_jobs(user)
+            .select_related("company", "country")
             .prefetch_related("location", "skills", "industry", "edu_qualification")
-            .get(id=job_id, user=user)
+            .get(id=job_id)
         )
     except JobPost.DoesNotExist:
         return Response({"error": "Job not found"}, status=status.HTTP_404_NOT_FOUND)
@@ -242,7 +245,7 @@ def update_job(request, job_id):
     user = request.user
 
     try:
-        job = JobPost.objects.get(id=job_id, user=user)
+        job = recruiter_jobs(user).get(id=job_id)
     except JobPost.DoesNotExist:
         return Response({"error": "Job not found"}, status=status.HTTP_404_NOT_FOUND)
 
@@ -299,7 +302,7 @@ def delete_job(request, job_id):
     user = request.user
 
     try:
-        job = JobPost.objects.get(id=job_id, user=user)
+        job = recruiter_jobs(user).get(id=job_id)
     except JobPost.DoesNotExist:
         return Response({"error": "Job not found"}, status=status.HTTP_404_NOT_FOUND)
 
@@ -349,7 +352,7 @@ def publish_job(request, job_id):
     user = request.user
 
     try:
-        job = JobPost.objects.get(id=job_id, user=user)
+        job = recruiter_jobs(user).get(id=job_id)
     except JobPost.DoesNotExist:
         return Response({"error": "Job not found"}, status=status.HTTP_404_NOT_FOUND)
 
@@ -403,7 +406,7 @@ def close_job(request, job_id):
     user = request.user
 
     try:
-        job = JobPost.objects.get(id=job_id, user=user)
+        job = recruiter_jobs(user).get(id=job_id)
     except JobPost.DoesNotExist:
         return Response({"error": "Job not found"}, status=status.HTTP_404_NOT_FOUND)
 
@@ -423,6 +426,59 @@ def close_job(request, job_id):
 
 @extend_schema(
     tags=["Recruiter - Jobs"],
+    summary="Set Job Email Notifications",
+    description=(
+        "Turn applicant email notifications on or off for a job. Allowed at any "
+        "job status, unlike the general update endpoint."
+    ),
+    request=RecruiterJobNotificationsSerializer,
+    responses={
+        200: RecruiterJobMutationResponseSerializer,
+        400: VALIDATION_ERROR_RESPONSE,
+        404: ErrorResponseSerializer,
+    },
+)
+@api_view(["PATCH"])
+@permission_classes([IsAuthenticated])
+def set_job_notifications(request, job_id):
+    """
+    Turn applicant email notifications on or off.
+
+    Deliberately separate from update_job, which refuses to touch a published
+    job. This is the recruiter's own notification preference rather than public
+    job content, and it is only useful once a job is Live — so the
+    published-jobs-are-immutable rule must not apply to it.
+    """
+    user = request.user
+
+    try:
+        job = recruiter_jobs(user).get(id=job_id)
+    except JobPost.DoesNotExist:
+        return Response({"error": "Job not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    serializer = RecruiterJobNotificationsSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    job.send_email_notifications = serializer.validated_data["send_email_notifications"]
+    job.save(update_fields=["send_email_notifications"])
+
+    detail = RecruiterJobDetailSerializer(job, context={"request": request})
+    return Response(
+        {
+            "success": True,
+            "job": detail.data,
+            "message": (
+                "Email notifications enabled"
+                if job.send_email_notifications
+                else "Email notifications disabled"
+            ),
+        }
+    )
+
+
+@extend_schema(
+    tags=["Recruiter - Jobs"],
     operation_id="recruiter_jobs_applicants_list",
     summary="Get Job Applicants",
     description="Get all applicants for a specific job",
@@ -430,7 +486,12 @@ def close_job(request, job_id):
         OpenApiParameter(
             "status",
             OpenApiTypes.STR,
-            description="Filter by application status (Pending, Shortlisted, Selected, Rejected)",
+            description="Filter by application status (Pending, Shortlisted, Hired, Rejected)",
+        ),
+        OpenApiParameter(
+            "search",
+            OpenApiTypes.STR,
+            description="Filter by applicant name, username or email",
         ),
         OpenApiParameter(
             "ordering",
@@ -450,12 +511,35 @@ def get_job_applicants(request, job_id):
     user = request.user
 
     try:
-        job = JobPost.objects.get(id=job_id, user=user)
+        job = recruiter_jobs(user).get(id=job_id)
     except JobPost.DoesNotExist:
         return Response({"error": "Job not found"}, status=status.HTTP_404_NOT_FOUND)
 
     # Get applications for this job
     applications = AppliedJobs.objects.filter(job_post=job).select_related("user")
+
+    # Free-text search on the applicant, matching the UI's
+    # "Search applicants by name or email" box.
+    search = request.GET.get("search")
+    if search:
+        applications = applications.filter(
+            Q(user__first_name__icontains=search)
+            | Q(user__last_name__icontains=search)
+            | Q(user__username__icontains=search)
+            | Q(user__email__icontains=search)
+        )
+
+    # The status tabs each show a count, so the stats have to be counted
+    # before the status filter is applied — otherwise picking one tab zeroes
+    # every other tab. They stay inside the search filter, so the counts do
+    # narrow along with the query.
+    counts = applications.aggregate(
+        total=Count("id"),
+        pending=Count("id", filter=Q(status="Pending")),
+        shortlisted=Count("id", filter=Q(status="Shortlisted")),
+        selected=Count("id", filter=Q(status="Hired")),
+        rejected=Count("id", filter=Q(status="Rejected")),
+    )
 
     # Filter by status
     status_filter = request.GET.get("status")
@@ -474,12 +558,14 @@ def get_job_applicants(request, job_id):
         {
             "job": {"id": job.id, "title": job.title, "status": job.status},
             "applications": serializer.data,
-            "total_applicants": applications.count(),
+            "total_applicants": counts["total"],
             "stats": {
-                "pending": applications.filter(status="Pending").count(),
-                "shortlisted": applications.filter(status="Shortlisted").count(),
-                "selected": applications.filter(status="Selected").count(),
-                "rejected": applications.filter(status="Rejected").count(),
+                "pending": counts["pending"],
+                "shortlisted": counts["shortlisted"],
+                # "selected" is the wire name the UI reads; the stored status
+                # is "Hired" (peeldb.models.POST_STATUS).
+                "selected": counts["selected"],
+                "rejected": counts["rejected"],
             },
         }
     )
@@ -518,7 +604,7 @@ def get_dashboard_stats(request):
     start_date = timezone.now() - timedelta(days=days)
     prev_start_date = start_date - timedelta(days=days)
 
-    jobs = JobPost.objects.filter(user=user)
+    jobs = recruiter_jobs(user)
 
     # Basic stats
     total_jobs = jobs.count()
@@ -528,7 +614,7 @@ def get_dashboard_stats(request):
     expired_jobs = jobs.filter(status="Expired").count()
 
     # Application stats
-    all_applicants = AppliedJobs.objects.filter(job_post__user=user)
+    all_applicants = AppliedJobs.objects.filter(job_post__in=jobs)
     total_applicants = all_applicants.count()
 
     # NEW: Applications in current period
@@ -760,7 +846,7 @@ def get_applicant_detail(request, job_id, applicant_id):
 
     # Verify job ownership
     try:
-        job = JobPost.objects.get(id=job_id, user=user)
+        job = recruiter_jobs(user).get(id=job_id)
     except JobPost.DoesNotExist:
         return Response({"error": "Job not found"}, status=status.HTTP_404_NOT_FOUND)
 
@@ -807,7 +893,7 @@ def update_applicant_status(request, job_id, applicant_id):
 
     # Verify job ownership
     try:
-        job = JobPost.objects.get(id=job_id, user=user)
+        job = recruiter_jobs(user).get(id=job_id)
     except JobPost.DoesNotExist:
         return Response({"error": "Job not found"}, status=status.HTTP_404_NOT_FOUND)
 

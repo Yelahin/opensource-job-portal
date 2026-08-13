@@ -8,6 +8,8 @@
 import { error, redirect, fail } from '@sveltejs/kit';
 import type { PageServerLoad, Actions } from './$types';
 import type { JobUpdateData, JobFormMetadata, JobDetail } from '$lib/types';
+import { API_BASE_URL } from '$lib/config/env';
+import { clearAuthCookies } from '$lib/server/auth';
 
 /**
  * Load function - runs on server before page renders
@@ -27,15 +29,14 @@ export const load: PageServerLoad = async ({ params, cookies, fetch, url }) => {
 	try {
 		// Fetch job details and form metadata in parallel
 		const [jobResponse, metadataResponse] = await Promise.all([
-			fetch(`http://localhost:8000/api/v1/recruiter/jobs/${jobId}/`),
-			fetch('http://localhost:8000/api/v1/recruiter/jobs/metadata/')
+			fetch(`${API_BASE_URL}/recruiter/jobs/${jobId}/`),
+			fetch(`${API_BASE_URL}/recruiter/jobs/metadata/`)
 		]);
 
 		// Handle job fetch errors
 		if (!jobResponse.ok) {
 			if (jobResponse.status === 401) {
-				cookies.delete('access_token', { path: '/' });
-				cookies.delete('refresh_token', { path: '/' });
+				clearAuthCookies(cookies);
 				throw redirect(302, '/login?redirect=' + encodeURIComponent(url.pathname));
 			}
 			if (jobResponse.status === 404) {
@@ -47,8 +48,7 @@ export const load: PageServerLoad = async ({ params, cookies, fetch, url }) => {
 		// Handle metadata fetch errors
 		if (!metadataResponse.ok) {
 			if (metadataResponse.status === 401) {
-				cookies.delete('access_token', { path: '/' });
-				cookies.delete('refresh_token', { path: '/' });
+				clearAuthCookies(cookies);
 				throw redirect(302, '/login?redirect=' + encodeURIComponent(url.pathname));
 			}
 			throw error(metadataResponse.status, `Failed to load form metadata: ${metadataResponse.statusText}`);
@@ -95,7 +95,7 @@ export const actions: Actions = {
 			console.log('Updating job data:', JSON.stringify(jobData, null, 2));
 
 			// Update job
-			const response = await fetch(`http://localhost:8000/api/v1/recruiter/jobs/${jobId}/update/`, {
+			const response = await fetch(`${API_BASE_URL}/recruiter/jobs/${jobId}/update/`, {
 				method: 'PATCH',
 				headers: {
 					'Content-Type': 'application/json'
@@ -157,7 +157,7 @@ export const actions: Actions = {
 			const jobData = extractJobDataFromForm(formData);
 
 			// Step 1: Update job
-			const updateResponse = await fetch(`http://localhost:8000/api/v1/recruiter/jobs/${jobId}/update/`, {
+			const updateResponse = await fetch(`${API_BASE_URL}/recruiter/jobs/${jobId}/update/`, {
 				method: 'PATCH',
 				headers: {
 					'Content-Type': 'application/json'
@@ -178,7 +178,7 @@ export const actions: Actions = {
 			// Step 2: Publish the job if it's not already published
 			if (updateResult.job.status !== 'Live') {
 				const publishResponse = await fetch(
-					`http://localhost:8000/api/v1/recruiter/jobs/${jobId}/publish/`,
+					`${API_BASE_URL}/recruiter/jobs/${jobId}/publish/`,
 					{
 						method: 'POST',
 						headers: {
@@ -240,9 +240,21 @@ function extractJobDataFromForm(formData: FormData): JobUpdateData {
 		return strValue === '' ? undefined : strValue;
 	};
 
-	// Helper to get boolean value
-	const getBoolean = (key: string): boolean => {
-		return formData.get(key) === 'true' || formData.get(key) === 'on';
+	// Helper to get boolean value.
+	//
+	// Absent means "this form does not carry the field", not "false". The update
+	// is a PATCH, so returning undefined leaves the stored value alone; the
+	// previous `=== 'true'` collapsed absence to false and wrote it back. That
+	// silently cleared show_salary — which defaults to *true* — on every save,
+	// along with fresher and relocation_required, none of which this form
+	// renders.
+	//
+	// A bare checkbox is also absent when unchecked, so any checkbox added here
+	// needs a hidden `value="false"` companion to be readable as off.
+	const getBoolean = (key: string): boolean | undefined => {
+		if (!formData.has(key)) return undefined;
+		const value = formData.get(key);
+		return value === 'true' || value === 'on';
 	};
 
 	// Helper to parse JSON field
@@ -309,7 +321,9 @@ function extractJobDataFromForm(formData: FormData): JobUpdateData {
 
 		// NEW ENHANCED FIELDS
 		seniority_level: getString('seniority_level') as any,
-		application_method: (getString('application_method') || 'portal') as any,
+		// No `|| 'portal'` fallback: this form does not render the field, so the
+		// default was overwriting an external application flow on every save.
+		application_method: getString('application_method') as any,
 		application_url: getString('application_url'),
 		benefits: getStringArray('benefits'),
 		language_requirements: getJSON('language_requirements'),
@@ -318,7 +332,8 @@ function extractJobDataFromForm(formData: FormData): JobUpdateData {
 		relocation_required: getBoolean('relocation_required'),
 		travel_percentage: getString('travel_percentage'),
 		hiring_timeline: getString('hiring_timeline') as any,
-		hiring_priority: (getString('hiring_priority') || 'Normal') as any,
+		// Likewise: unrendered here, so the fallback demoted every Urgent job
+		hiring_priority: getString('hiring_priority') as any,
 
 		// Walk-in fields
 		walkin_contactinfo: getString('walkin_contactinfo'),

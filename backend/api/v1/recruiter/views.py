@@ -38,8 +38,12 @@ from .serializers import (
 
 
 def is_company_admin(user):
-    """Check if user is a company admin"""
-    return user.user_type == "EM" and user.is_admin and user.company is not None
+    """Whether ``user`` may act for their whole company.
+
+    Thin wrapper over ``User.is_company_admin`` so the rule has one definition.
+    ``api/v1/recruiter/scoping.py`` reads the property directly.
+    """
+    return user.is_company_admin
 
 
 def send_team_invitation_email(invitation, message=None):
@@ -467,6 +471,67 @@ def remove_team_member(request, user_id):
         {
             "success": True,
             "message": f"{member_name} has been removed from {user.company.name}",
+        }
+    )
+
+
+@extend_schema(
+    tags=["Team Management"],
+    summary="Toggle Team Member Status",
+    description="Activate or deactivate a team member (Admin only)",
+    request=None,
+    responses={
+        200: TeamMemberUpdateResponseSerializer,
+        400: ErrorResponseSerializer,
+        403: ErrorResponseSerializer,
+        404: ErrorResponseSerializer,
+    },
+)
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def toggle_team_member_status(request, user_id):
+    """
+    Activate or deactivate a team member (Admin only)
+
+    A deactivated member keeps their company membership and their jobs, but
+    cannot log in.
+    """
+    user = request.user
+
+    if not is_company_admin(user):
+        return Response(
+            {"error": "Only company admins can change team member status"},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    try:
+        member = User.objects.get(id=user_id, company=user.company, user_type="EM")
+    except User.DoesNotExist:
+        return Response(
+            {"error": "User not found in your company"},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    # Prevent locking yourself out. This is also what keeps the company
+    # manageable: the caller is an active admin and cannot deactivate itself,
+    # so there is always at least one active admin left afterwards.
+    if member.id == user.id:
+        return Response(
+            {"error": "You cannot change your own status"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    member.is_active = not member.is_active
+    member.save(update_fields=["is_active"])
+
+    member_name = f"{member.first_name} {member.last_name}".strip() or member.email
+    state = "activated" if member.is_active else "deactivated"
+
+    return Response(
+        {
+            "success": True,
+            "user": TeamMemberSerializer(member).data,
+            "message": f"{member_name} has been {state}",
         }
     )
 

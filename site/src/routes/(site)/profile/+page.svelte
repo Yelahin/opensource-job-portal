@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { authStore } from '$lib/stores/auth';
+	import { invalidateAll } from '$app/navigation';
 	import { toast } from '$lib/stores/toast';
 	import { getProfile, patchProfile, type UserProfile } from '$lib/api/profile';
 	import { Save, Loader, User, Sparkles } from '@lucide/svelte';
@@ -10,6 +10,7 @@
 	import AddressInfoSection from '$lib/components/profile/AddressInfoSection.svelte';
 	import LocationSection from '$lib/components/profile/LocationSection.svelte';
 	import ProfessionalInfoSection from '$lib/components/profile/ProfessionalInfoSection.svelte';
+	import AccountSecuritySection from '$lib/components/profile/AccountSecuritySection.svelte';
 
 	let profile: UserProfile | null = null;
 	let loading = true;
@@ -154,12 +155,9 @@
 
 			profile = await patchProfile(updatePayload);
 
-			authStore.updateUser({
-				...$authStore.user!,
-				first_name: profile.first_name,
-				last_name: profile.last_name,
-				profile_completion_percentage: profile.profile_completion_percentage
-			});
+			// The header reads the user from the server-loaded layout data, so
+			// re-run the loads rather than mutating a client-side copy.
+			await invalidateAll();
 
 			toast.success('Profile updated successfully!');
 		} catch (err) {
@@ -315,4 +313,16 @@
 			</button>
 		</div>
 	</form>
+
+	<!--
+		Outside the profile <form> on purpose: this section posts to its own
+		endpoints (change-email / change-password) and nested forms are invalid
+		HTML — inside, its submit buttons would trigger the profile save.
+	-->
+	<div
+		class="bg-white rounded-lg shadow-sm border border-border overflow-hidden animate-fade-in-up mt-6"
+		style="opacity: 0; animation-delay: 450ms; animation-fill-mode: forwards;"
+	>
+		<AccountSecuritySection email={profile.email} pendingEmail={profile.pending_email ?? ''} />
+	</div>
 {/if}

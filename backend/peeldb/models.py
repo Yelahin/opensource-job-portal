@@ -10,6 +10,8 @@ from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin, UserM
 
 # from oauth2client.contrib.django_util.models import CredentialsField
 from django.contrib.postgres.fields import ArrayField
+from django.contrib.postgres.indexes import GinIndex
+from django.contrib.postgres.search import SearchVector, SearchVectorField
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import models
 from django.db.models import Count, F, JSONField, Q
@@ -216,14 +218,20 @@ class City(models.Model):
     state = models.ForeignKey(State, related_name="state", on_delete=models.PROTECT)
     status = models.CharField(choices=STATUS_TYPES, max_length=10, default="Enabled")
     slug = models.SlugField(max_length=500)
-    internship_text = models.CharField(max_length=1000)
-    meta_title = models.TextField(default="")
-    meta_description = models.TextField(default="")
-    internship_meta_title = models.TextField(default="")
-    internship_meta_description = models.TextField(default="")
-    page_content = models.TextField(default="")
-    internship_content = models.TextField(default="")
-    meta = JSONField(null=True)
+    # These are all optional SEO/marketing copy, and `save()` below runs
+    # `full_clean()`. Without `blank=True` a City saved with nothing but its own
+    # defaults fails its own validation — `default=""` and "cannot be blank" are
+    # contradictory. That is why creating a City in a test needed eight
+    # placeholder strings, and it made the model unusable from any code path
+    # that did not populate every marketing field.
+    internship_text = models.CharField(max_length=1000, blank=True, default="")
+    meta_title = models.TextField(blank=True, default="")
+    meta_description = models.TextField(blank=True, default="")
+    internship_meta_title = models.TextField(blank=True, default="")
+    internship_meta_description = models.TextField(blank=True, default="")
+    page_content = models.TextField(blank=True, default="")
+    internship_content = models.TextField(blank=True, default="")
+    meta = JSONField(null=True, blank=True)
 
     def __str__(self):
         return self.name
@@ -370,24 +378,15 @@ class Company(models.Model):
             return str(self.profile_pic)
         return "https://cdn.peeljobs.com/static/company_logo.png"
 
-    def get_description(self):
-        from bs4 import BeautifulSoup
-
-        html = self.profile
-        # create a new bs4 object from the html data loaded
-        soup = BeautifulSoup(html)
-        # remove all javascript and stylesheet code
-        for script in soup(["script", "style"]):
-            script.extract()
-        # get text
-        text = soup.get_text()
-        # break into lines and remove leading and trailing space on each
-        lines = (line.strip() for line in text.splitlines())
-        # break multi-headlines into a line each
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        # drop blank lines
-        text = "\n<br>".join(chunk for chunk in chunks if chunk)
-        return text
+    # `get_description()` — stripped HTML out of `profile` with BeautifulSoup —
+    # was deleted 2026-08-13 alongside `JobPost.get_job_description()`. Neither
+    # had a single caller in any tracked file, and `bs4` was never a declared
+    # dependency: it reached the app only as a transitive of `behave-django`,
+    # a *dev* dependency. So `uv sync --no-dev` would have made both methods
+    # raise ImportError, and the function-local import meant nothing failed
+    # until they were called. Deleting `features/` took behave-django with it
+    # and would have armed that. Bring bs4 in properly if HTML stripping is
+    # wanted again.
 
     def get_website(self):
         site = self.website
@@ -484,12 +483,17 @@ MARTIAL_STATUS = (
     ("Married", "Married"),
 )
 
+# "Careers" was removed 2026-08-13 with the `/process-email/` webhook, its only
+# writer. That view regex-matched an email address out of an inbound message
+# body and, if unknown, created a Job Seeker account and mailed it a generated
+# password — unauthenticated, with none of the SNS envelope verification the
+# bounce handler does. Zero of the 34,775 users in the production snapshot were
+# ever created that way, so nothing is orphaned by dropping the choice.
 REGISTERED_FROM = (
     ("Email", "Email"),
     ("Social", "Social"),
     ("ResumePool", "ResumePool"),
     ("Resume", "Resume"),
-    ("Careers", "Careers"),
 )
 
 
@@ -613,6 +617,14 @@ class User(AbstractBaseUser, PermissionsMixin):
     is_admin = models.BooleanField(default=False)  # agency created user
     profile_completeness = models.CharField(max_length=500, default="")
     activation_code = models.CharField(max_length=100, null=True, blank=True)
+    # Address a user has asked to move to but has not yet confirmed.
+    #
+    # `email` is the login identifier, so it must not change until the new
+    # address is proven reachable — otherwise a typo locks the account out of
+    # both the old and new inbox. The swap happens in
+    # api/v1/auth/views.py:verify_email_change once the token sent *to the new
+    # address* comes back.
+    pending_email = models.EmailField(max_length=255, blank=True, default="")
     # is_register_through_mail = models.BooleanField(default=False)
     registered_from = models.CharField(
         choices=REGISTERED_FROM, max_length=15, default=""
@@ -1263,6 +1275,10 @@ class JobPost(models.Model):
     )
 
     send_email_notifications = models.BooleanField(default=False)
+    # Incremented on each public job-detail fetch, excluding the job's own
+    # recruiter. Replaces the removed fb_views/tw_views/ln_views/other_views
+    # fields, which only ever counted social referrals.
+    views_count = models.PositiveIntegerField(default=0)
     agency_category = models.ForeignKey(
         AgencyCompanyCatogery, null=True, on_delete=models.SET_NULL
     )
@@ -1378,9 +1394,48 @@ class JobPost(models.Model):
         help_text="Urgency level for filling this position",
     )
 
+    # Full-text search vector, maintained by Postgres rather than by the
+    # application. A STORED generated column is recomputed inside whatever
+    # transaction writes the row, so it cannot drift from the data the way the
+    # Elasticsearch index it replaced could — there is nothing to reindex and no
+    # signal handler to keep connected.
+    #
+    # Weights rank a title hit above a description hit: A title, B job_role,
+    # C company_name, D description. All four are columns on this table, which
+    # is what makes a single generated column possible; skills and locations
+    # stay relational facets in JobFilter.
+    #
+    # This is deferred on read paths (see api/v1/jobs/views.py) — it is a fat
+    # column and no serializer exposes it.
+    search_vector = models.GeneratedField(
+        expression=(
+            SearchVector("title", weight="A", config="english")
+            + SearchVector("job_role", weight="B", config="english")
+            + SearchVector("company_name", weight="C", config="english")
+            + SearchVector("description", weight="D", config="english")
+        ),
+        output_field=SearchVectorField(),
+        db_persist=True,
+    )
+
     # objects = JobPostManager()
     class Meta:
         ordering = ["-created_on"]
+        indexes = [
+            GinIndex(fields=["search_vector"], name="jobpost_search_vector_gin"),
+            # Backs the trigram fallback in JobFilter.filter_search, which only
+            # runs when the full-text query matches nothing (a typo).
+            #
+            # `opclasses=`, not `OpClass(F("title"))`: the latter compiles to
+            # `USING gin (("title" gin_trgm_ops))`, and the extra parentheses
+            # make Postgres read it as an expression index, which is a syntax
+            # error. `opclasses=` emits `USING gin ("title" gin_trgm_ops)`.
+            GinIndex(
+                fields=["title"],
+                opclasses=["gin_trgm_ops"],
+                name="jobpost_title_trgm_gin",
+            ),
+        ]
 
     def __unicode__(self):
         return self.title
@@ -1563,32 +1618,9 @@ class JobPost(models.Model):
         else:
             return self.min_salary, self.max_salary
 
-    def get_job_description(self):
-        from bs4 import BeautifulSoup
-
-        soup = BeautifulSoup(self.description)
-        for s in soup(["script", "style"]):
-            s.extract()
-        return " ".join(soup.stripped_strings)
-
-    def get_description(self):
-        from bs4 import BeautifulSoup
-
-        html = self.description
-        # create a new bs4 object from the html data loaded
-        soup = BeautifulSoup(html)
-        # remove all javascript and stylesheet code
-        for script in soup(["script", "style"]):
-            script.extract()
-        # get text
-        text = soup.get_text()
-        # break into lines and remove leading and trailing space on each
-        lines = (line.strip() for line in text.splitlines())
-        # break multi-headlines into a line each
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        # drop blank lines
-        text = "\n".join(chunk for chunk in chunks if chunk)
-        return text
+    # `get_job_description()` and `get_description()` deleted 2026-08-13 — both
+    # BeautifulSoup HTML strippers with no caller anywhere. See the note on
+    # `Company.get_website` for why `bs4` had been available at all.
 
     def get_company_emails(self):
         return self.company_emails
@@ -1724,7 +1756,12 @@ class JobAlert(models.Model):
     role = models.CharField(max_length=2000, blank=True, null=True)
     related_jobs = models.BooleanField(default=False)
     email = models.EmailField(blank=True, null=True)
-    name = models.CharField(max_length=2000, unique=True)
+    # A label the subscriber types ("Wp developer", "Webdesign"). This was
+    # `unique=True`, which is wrong for free text a user picks: the second
+    # person to name an alert "Java Developer" got an IntegrityError, and the
+    # constraint is global rather than per-email so there is no way to opt out
+    # of the collision.
+    name = models.CharField(max_length=2000)
     unsubscribe_code = models.CharField(max_length=100, null=True, blank=True)
     is_unsubscribe = models.BooleanField(default=False)
     subscribe_code = models.CharField(max_length=100, null=True, blank=True)

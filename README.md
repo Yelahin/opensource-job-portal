@@ -1,8 +1,7 @@
 # PeelJobs - Dynamic Job Board Platform
 
-[![Codacy Badge](https://api.codacy.com/project/badge/Grade/105a3bf03bec4cfbac70d7c30e574bea)](https://www.codacy.com/manual/ashwin/opensource-job-portal?utm_source=github.com&utm_medium=referral&utm_content=MicroPyramid/opensource-job-portal&utm_campaign=Badge_Grade)  
-[![Build Status](https://travis-ci.org/MicroPyramid/opensource-job-portal.svg?branch=master)](https://travis-ci.org/MicroPyramid/opensource-job-portal)  
-[![Coverage Status](https://coveralls.io/repos/github/MicroPyramid/opensource-job-portal/badge.svg?branch=master)](https://coveralls.io/github/MicroPyramid/opensource-job-portal?branch=master)
+[![Documentation Status](https://readthedocs.org/projects/opensource-job-portal/badge/?version=latest)](https://opensource-job-portal.readthedocs.io/en/latest/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **PeelJobs** is a dynamic, user-centric job board platform designed to streamline the entire hiring process, from job posting to application management. Built with modern web technologies, it offers a seamless experience for job seekers, recruiters, and administrators through robust role-based access control (RBAC).
 
@@ -73,7 +72,7 @@ PeelJobs implements a comprehensive role-based access control system with distin
 - **Favorites System**: Save and organize interesting job opportunities
 
 ### ⚡ Technical Excellence
-- **Lightning-Fast Search**: Elasticsearch-powered full-text search with instant results
+- **Lightning-Fast Search**: Ranked Postgres full-text search with typo tolerance — no separate search service to run
 - **Background Processing**: Redis + Celery for email notifications and heavy operations
 - **Smart Caching**: Memcached integration for optimized page load times
 - **RESTful APIs**: Comprehensive API endpoints for third-party integrations
@@ -87,7 +86,7 @@ PeelJobs implements a comprehensive role-based access control system with distin
 ### Backend Infrastructure
 - **Framework**: Django 4.2.22 (Python)
 - **Database**: PostgreSQL with optimized queries
-- **Search Engine**: Elasticsearch 7.17.6
+- **Search Engine**: PostgreSQL full-text search (`tsvector` + `pg_trgm`)
 - **Task Queue**: Celery 5.5.0 with Redis broker
 - **Caching**: Redis + Memcached for multi-layer caching
 

@@ -3,11 +3,10 @@ Job Views for API v1
 Provides job listing, detail, and filter options endpoints
 """
 
-from django.db.models import Count, Q
+from django.db.models import Count, F, Q
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema
-from rest_framework import filters as drf_filters
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
@@ -25,8 +24,8 @@ from peeldb.models import (
     Skill,
 )
 
-from .filters import JobFilter
-from .serializers import JobDetailSerializer, JobListSerializer
+from .filters import JobFilter, RelevanceOrderingFilter
+from .serializers import AppliedJobSerializer, JobDetailSerializer, JobListSerializer
 
 
 class JobPagination(PageNumberPagination):
@@ -66,13 +65,16 @@ class JobViewSet(viewsets.ReadOnlyModelViewSet):
 
     permission_classes = [AllowAny]
     pagination_class = JobPagination
+    # `drf_filters.SearchFilter` used to sit here alongside JobFilter, and both
+    # bind `?search=`. That double-filtered every query, ANDing an `icontains`
+    # scan over the FilterSet's own result. Harmless while both did the same
+    # `icontains`, but it would silently undo full-text and fuzzy matching, so
+    # the search backend is gone and JobFilter.filter_search owns the param.
     filter_backends = [
         DjangoFilterBackend,
-        drf_filters.SearchFilter,
-        drf_filters.OrderingFilter,
+        RelevanceOrderingFilter,
     ]
     filterset_class = JobFilter
-    search_fields = ["title", "company_name", "description", "job_role"]
     ordering_fields = [
         "published_on",
         "title",
@@ -92,6 +94,11 @@ class JobViewSet(viewsets.ReadOnlyModelViewSet):
             JobPost.objects.filter(status="Live")
             .select_related("company", "country", "major_skill")
             .prefetch_related("location", "skills", "industry", "edu_qualification")
+            # search_vector is a generated column, so Django selects it like any
+            # other field — a tsvector of the full description, on every row of
+            # every page, that no serializer reads. Filtering and ranking still
+            # work deferred; only the transfer is skipped.
+            .defer("search_vector")
             .distinct()
         )
 
@@ -134,8 +141,28 @@ class JobViewSet(viewsets.ReadOnlyModelViewSet):
                 {"detail": "Job not found."}, status=status.HTTP_404_NOT_FOUND
             )
 
+        self._record_view(request, instance)
+
         serializer = self.get_serializer(instance)
         return Response(serializer.data)
+
+    @staticmethod
+    def _record_view(request, instance):
+        """
+        Count a public view of this job.
+
+        Every fetch counts — this is a raw view count, not unique visitors, so a
+        refresh counts again. The job's own recruiter is excluded so a recruiter
+        checking their listing does not inflate their own number.
+
+        Updated through the queryset with F() rather than instance.save() so
+        concurrent views cannot clobber each other.
+        """
+        user = request.user
+        if user.is_authenticated and user.id == instance.user_id:
+            return
+
+        JobPost.objects.filter(pk=instance.pk).update(views_count=F("views_count") + 1)
 
     @extend_schema(
         summary="List jobs",
@@ -264,6 +291,47 @@ class JobViewSet(viewsets.ReadOnlyModelViewSet):
         },
         tags=["Jobs"],
     )
+    @extend_schema(
+        summary="List my job applications",
+        description=(
+            "Every job the authenticated user has applied to, newest first, "
+            "with the current status of each application."
+        ),
+        parameters=[
+            OpenApiParameter(
+                name="status",
+                type=OpenApiTypes.STR,
+                description="Filter by application status (Pending, Shortlisted, Hired, Rejected)",
+                required=False,
+            ),
+        ],
+        responses={200: AppliedJobSerializer(many=True)},
+        tags=["Jobs"],
+    )
+    @action(
+        detail=False,
+        methods=["get"],
+        permission_classes=[IsAuthenticated],
+        url_path="applied",
+    )
+    def applied_jobs(self, request):
+        """Get every job the authenticated user has applied to."""
+        applications = (
+            AppliedJobs.objects.filter(user=request.user)
+            .select_related("job_post", "job_post__company")
+            .prefetch_related("job_post__location", "job_post__skills")
+            .order_by("-applied_on")
+        )
+
+        status_filter = request.GET.get("status")
+        if status_filter:
+            applications = applications.filter(status=status_filter)
+
+        serializer = AppliedJobSerializer(
+            applications, many=True, context={"request": request}
+        )
+        return Response(serializer.data)
+
     @action(
         detail=False,
         methods=["get", "post"],
@@ -449,9 +517,26 @@ class JobFilterOptionsView(APIView):
 
     permission_classes = [AllowAny]
 
+    #: Enough to populate a filter sidebar without shipping every skill in the
+    #: database to a page that only renders a dozen of them.
+    DEFAULT_FACET_LIMIT = 50
+
     @extend_schema(
         summary="Get filter options",
         description="Retrieve all available filter options (locations, skills, industries, education) with job counts",
+        parameters=[
+            OpenApiParameter(
+                name="limit",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.QUERY,
+                description=(
+                    "Max locations and skills to return, ordered by job count. "
+                    "Defaults to 50; pass 0 for all of them. Industries and "
+                    "education are always returned in full."
+                ),
+                required=False,
+            )
+        ],
         responses={
             200: {
                 "type": "object",
@@ -491,6 +576,16 @@ class JobFilterOptionsView(APIView):
     def get(self, request):
         """Get all filter options with job counts"""
 
+        # `?limit=0` lifts the cap. The SEO directory pages
+        # (/jobs-by-skill/ and friends) exist to enumerate *every* facet — that
+        # is how crawlers reach the long-tail landing pages — so a top-50 slice
+        # is exactly wrong for them. Everything else wants the default.
+        try:
+            limit = int(request.query_params.get("limit", self.DEFAULT_FACET_LIMIT))
+        except (TypeError, ValueError):
+            limit = self.DEFAULT_FACET_LIMIT
+        facet_slice = slice(None) if limit <= 0 else slice(limit)
+
         # Base queryset for live jobs
         live_jobs = JobPost.objects.filter(status="Live")
 
@@ -499,7 +594,7 @@ class JobFilterOptionsView(APIView):
             City.objects.filter(locations__in=live_jobs)
             .annotate(count=Count("locations", filter=Q(locations__status="Live")))
             .order_by("-count", "name")
-            .values("id", "name", "slug", "count")[:50]
+            .values("id", "name", "slug", "count")[facet_slice]
         )
 
         # Get skills with job counts
@@ -507,7 +602,7 @@ class JobFilterOptionsView(APIView):
             Skill.objects.filter(jobpost__in=live_jobs)
             .annotate(count=Count("jobpost", filter=Q(jobpost__status="Live")))
             .order_by("-count", "name")
-            .values("id", "name", "slug", "count")[:50]
+            .values("id", "name", "slug", "count")[facet_slice]
         )
 
         # Get industries with job counts
