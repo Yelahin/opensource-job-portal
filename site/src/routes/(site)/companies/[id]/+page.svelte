@@ -264,7 +264,7 @@
               About {company.name}
             </h2>
             <p class="text-muted leading-relaxed whitespace-pre-line">
-              {company.profile}
+              {@html company.profile}
             </p>
           </div>
         {/if}
