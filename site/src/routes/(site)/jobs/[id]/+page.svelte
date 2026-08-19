@@ -621,9 +621,9 @@
             </h2>
 
             {#if job.company_description}
-              <p class="text-muted leading-relaxed mb-5 whitespace-pre-line">
+              <div class="text-muted leading-relaxed mb-5 whitespace-pre-line">
                 {@html job.company_description}
-              </p>
+              </div>
             {/if}
 
             <div class="space-y-3">
